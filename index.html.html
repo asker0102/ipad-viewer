@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>iPad画面</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stage { position: fixed; overflow: hidden; background: #000; }
+  #stage video { position: absolute; display: block; object-fit: fill; }
+  #panel {
+    position: fixed; top: 10px; left: 10px; max-width: calc(100% - 20px); box-sizing: border-box;
+    display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; z-index: 2;
+    background: rgba(30,30,30,.9); color: #eee; font: 13px system-ui, sans-serif;
+    padding: 8px 12px; border-radius: 8px; transition: opacity .3s;
+  }
+  #panel.hidden { opacity: 0; pointer-events: none; }
+  #panel label { display: flex; align-items: center; gap: 6px; }
+  #panel select, #panel button { font: inherit; }
+  #panel input[type=range] { width: 110px; }
+  .val, #info { color: #aaa; }
+  #hint { color: #ffd479; }
+  #hint:empty { display: none; }
+  #msg {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 1;
+    color: #ddd; font: 16px/1.7 system-ui, sans-serif; text-align: center; padding: 24px;
+    white-space: pre-line; pointer-events: none;
+  }
+  body.idle { cursor: none; }
+</style>
+</head>
+<body>
+<div id="stage"><video id="v" autoplay playsinline muted></video></div>
+<div id="msg">カメラの使用を許可してください</div>
+<div id="panel">
+  <label>入力 <select id="sel"></select></label>
+  <span id="info"></span>
+  <label>左右カット <input type="range" id="cx" min="0" max="25" step="0.1"></label><span class="val" id="cxv"></span>
+  <label>上下カット <input type="range" id="cy" min="0" max="25" step="0.1"></label><span class="val" id="cyv"></span>
+  <button id="pop" title="黒帯が出ない形のウィンドウで開きます">専用ウィンドウで開く</button>
+  <button id="fs" title="ダブルクリックでも切り替え">全画面 (F)</button>
+  <span id="hint"></span>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v'), stage = $('stage'), sel = $('sel'), msg = $('msg');
+const info = $('info'), hint = $('hint'), panel = $('panel');
+const cx = $('cx'), cy = $('cy'), cxv = $('cxv'), cyv = $('cyv');
+const KEY = 'ipadViewer.settings';
+const isPopup = location.hash === '#popup';
+let stream = null;
+
+// ---- 設定の保存（入力機器と切り取り量） ----
+function loadSettings() { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } }
+function saveSettings() { try { localStorage.setItem(KEY, JSON.stringify(settings)); } catch (e) {} }
+const settings = loadSettings();
+if (typeof settings.cropX !== 'number') settings.cropX = 7.0;  // 左右それぞれ何%切るか
+if (typeof settings.cropY !== 'number') settings.cropY = 0;    // 上下それぞれ何%切るか
+
+// ---- 表示位置の計算（切り取った部分がちょうど収まるように） ----
+function srcSize() { return { w: v.videoWidth || 1920, h: v.videoHeight || 1080 }; }
+function aspect() {
+  const s = srcSize();
+  return (s.w * (1 - 2 * settings.cropX / 100)) / (s.h * (1 - 2 * settings.cropY / 100));
+}
+function layout() {
+  const { w: vw, h: vh } = srcSize();
+  const fx = settings.cropX / 100, fy = settings.cropY / 100;
+  const cw = vw * (1 - 2 * fx), ch = vh * (1 - 2 * fy);
+  const W = innerWidth, H = innerHeight;
+  const s = Math.min(W / cw, H / ch);
+  let sw = cw * s, sh = ch * s, sx = s, sy = s;
+  // ほぼぴったりのときは数pxの黒い隙間が出ないように埋める
+  if (W - sw < 4 && H - sh < 4) { sx = W / cw; sy = H / ch; sw = W; sh = H; }
+  stage.style.width = sw + 'px';
+  stage.style.height = sh + 'px';
+  stage.style.left = (W - sw) / 2 + 'px';
+  stage.style.top = (H - sh) / 2 + 'px';
+  v.style.width = vw * sx + 'px';
+  v.style.height = vh * sy + 'px';
+  v.style.left = -vw * fx * sx + 'px';
+  v.style.top = -vh * fy * sy + 'px';
+}
+function showCropValues() {
+  const { w, h } = srcSize();
+  cx.value = settings.cropX;
+  cy.value = settings.cropY;
+  cxv.textContent = `各${settings.cropX.toFixed(1)}%（${Math.round(w * settings.cropX / 100)}px）`;
+  cyv.textContent = `各${settings.cropY.toFixed(1)}%（${Math.round(h * settings.cropY / 100)}px）`;
+}
+
+// ---- 専用ウィンドウ：映像と同じ形に自動で合わせる ----
+let lastW = innerWidth, lastH = innerHeight, fitTimer;
+function fitWindow(keepHeight) {
+  if (!isPopup) return;
+  const a = aspect(), W = innerWidth, H = innerHeight;
+  let tw = W, th = H;
+  if (!keepHeight && Math.abs(W - lastW) > Math.abs(H - lastH)) th = Math.round(W / a);  // 幅を変えた → 高さを合わせる
+  else tw = Math.round(H * a);                                                           // 高さを変えた → 幅を合わせる
+  if (Math.abs(tw - W) > 1 || Math.abs(th - H) > 1) {
+    try { window.resizeBy(tw - W, th - H); } catch (e) {}
+  }
+  lastW = tw; lastH = th;
+}
+addEventListener('resize', () => {
+  layout();
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(() => fitWindow(false), 300);
+});
+
+function onCrop() {
+  settings.cropX = parseFloat(cx.value);
+  settings.cropY = parseFloat(cy.value);
+  saveSettings();
+  showCropValues();
+  layout();
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(() => fitWindow(true), 150);
+}
+cx.addEventListener('input', onCrop);
+cy.addEventListener('input', onCrop);
+
+function onVideoSize() { layout(); showCropValues(); fitWindow(true); }
+v.addEventListener('loadedmetadata', onVideoSize);
+v.addEventListener('resize', onVideoSize);
+
+// ---- カメラ（キャプチャーボード） ----
+async function start(deviceId) {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  const video = { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } };
+  if (deviceId) video.deviceId = { exact: deviceId };
+  stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+  v.srcObject = stream;
+  const track = stream.getVideoTracks()[0];
+  const s = track.getSettings();
+  info.textContent = `${s.width}×${s.height}  ${Math.round(s.frameRate || 0)}fps`;
+  msg.textContent = '';
+  track.onended = () => {
+    msg.textContent = '映像が途切れました。\nケーブルを確認してから再読み込み（F5）してください。';
+  };
+  return track;
+}
+
+async function listCams() {
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  sel.innerHTML = '';
+  devs.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId;
+    o.dataset.label = d.label;
+    o.textContent = d.label || `カメラ ${i + 1}`;
+    sel.appendChild(o);
+  });
+  return devs;
+}
+
+function errText(e) {
+  switch (e.name) {
+    case 'NotAllowedError':
+      return 'カメラの使用が拒否されました。\nアドレスバー左のアイコンから「カメラ：許可」にして、再読み込みしてください。';
+    case 'NotFoundError':
+      return 'キャプチャーボードが見つかりません。\nUSBの接続を確認してください。';
+    case 'NotReadableError':
+      return 'キャプチャーボードを他のアプリが使っています。\nOBS などを閉じてから再読み込み（F5）してください。';
+    default:
+      return `エラー: ${e.name}\n${e.message}`;
+  }
+}
+
+async function init() {
+  showCropValues();
+  layout();
+  if (isPopup) {
+    $('pop').style.display = 'none';
+    document.title = 'iPad画面（共有用）';
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    msg.textContent = 'このブラウザでは使えません。\nChrome か Edge で開いてください。';
+    return;
+  }
+  try {
+    let track = await start();          // 許可をもらうため、まず既定のカメラで起動
+    const devs = await listCams();      // 許可後でないと機器名が取れない
+    let target = null;
+    if (settings.label) target = devs.find(d => d.label === settings.label);
+    if (!target && Number.isInteger(settings.index) && settings.index < devs.length) target = devs[settings.index];
+    if (target && target.deviceId && target.deviceId !== track.getSettings().deviceId) {
+      track = await start(target.deviceId);
+    }
+    sel.value = track.getSettings().deviceId || '';
+    if (devs.length > 1 && settings.index === undefined) {
+      hint.textContent = '← 「入力」でキャプチャーボードを選んでください（次回から自動）';
+    }
+  } catch (e) {
+    msg.textContent = errText(e);
+  }
+}
+
+sel.addEventListener('change', async () => {
+  try {
+    await start(sel.value);
+    const opt = sel.options[sel.selectedIndex];
+    settings.label = opt.dataset.label || '';
+    settings.index = sel.selectedIndex;
+    saveSettings();
+    hint.textContent = '';
+  } catch (e) {
+    msg.textContent = errText(e);
+  }
+  sel.blur();
+});
+
+// 抜き差しされたら一覧を更新
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', async () => {
+    const cur = sel.value;
+    await listCams();
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  });
+}
+
+// ---- 専用ウィンドウを開く ----
+$('pop').addEventListener('click', () => {
+  const a = aspect();
+  let h = Math.round(screen.availHeight * 0.6), w = Math.round(h * a);
+  if (w > screen.availWidth * 0.9) { w = Math.round(screen.availWidth * 0.9); h = Math.round(w / a); }
+  const left = Math.round((screen.availLeft || 0) + (screen.availWidth - w) / 2);
+  const top = Math.round((screen.availTop || 0) + (screen.availHeight - h) / 2);
+  const url = location.href.split('#')[0] + '#popup';
+  const win = window.open(url, 'ipadViewerPopup', `popup=yes,width=${w},height=${h},left=${left},top=${top}`);
+  if (!win) {
+    msg.textContent = 'ポップアップがブロックされました。\nアドレスバー右端のアイコンから許可してください。';
+    return;
+  }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  v.srcObject = null;
+  msg.textContent = '専用ウィンドウで表示中です。\nこのタブは閉じて大丈夫です（このタブで見るときは F5）。';
+});
+
+// ---- 全画面 ----
+function toggleFS() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+$('fs').addEventListener('click', toggleFS);
+stage.addEventListener('dblclick', toggleFS);
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.key === 'f' || e.key === 'F') toggleFS();
+});
+
+// ---- マウスを動かさないとメニューとカーソルを隠す ----
+let hideTimer;
+function hidePanel() {
+  if (panel.matches(':hover') || document.activeElement === sel) {
+    hideTimer = setTimeout(hidePanel, 1000);
+    return;
+  }
+  panel.classList.add('hidden');
+  document.body.classList.add('idle');
+}
+function showPanel() {
+  panel.classList.remove('hidden');
+  document.body.classList.remove('idle');
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(hidePanel, 2500);
+}
+document.addEventListener('mousemove', showPanel);
+showPanel();
+
+init();
+</script>
+</body>
+</html>
